@@ -572,3 +572,315 @@ Solo esos chunks (no el documento completo) se inyectan en el prompt. Así, docu
 R: Los LLMs no tienen un interruptor que desactive su conocimiento previo. La instrucción
 influye en el comportamiento pero no lo garantiza. El modelo puede mezclar lo que lee en el
 documento con lo que ya sabe, especialmente para papers famosos como este.
+
+---
+
+## Mejora Implementada: D — Multi-PDF con citación automática de fuente
+
+### Qué hace
+
+Extiende el sistema para manejar **múltiples documentos simultáneamente**. En vez de tener
+un único PDF "cableado" en la sesión, carga todos los PDFs de la carpeta `data/` al inicio
+y permite subir más en tiempo real. Cuando el modelo responde, obliga a indicar de cuál
+archivo PDF proviene cada afirmación con el formato `[nombre_archivo.pdf]`.
+
+**Puerto:** `8082` (separado de la demo original en `8080` y Mejora B en `8081`)
+
+---
+
+### Función 1: `load_pdfs_from_folder(folder: str) -> dict`
+
+```python
+def load_pdfs_from_folder(folder: str) -> dict:
+    """Carga todos los PDFs de una carpeta. Retorna {filename: text}."""
+    docs = {}
+    if os.path.isdir(folder):                          # Solo si la carpeta existe
+        for fname in sorted(os.listdir(folder)):       # sorted → orden alfabético consistente
+            if fname.lower().endswith(".pdf"):          # Solo archivos PDF
+                fpath = os.path.join(folder, fname)    # Ruta completa al archivo
+                try:
+                    docs[fname] = extract_text_from_pdf(fpath)  # Usa la función del Paso 1
+                except Exception as e:
+                    print(f"Error leyendo {fname}: {e}")        # Log pero no rompe el bucle
+    return docs   # Dict: {"archivo.pdf": "texto completo..."}
+```
+
+**Línea por línea:**
+- `os.path.isdir(folder)`: Verifica que la carpeta existe antes de intentar listar. Si no
+  existe, `os.listdir` lanzaría `FileNotFoundError`. El `if` lo previene silenciosamente.
+- `sorted(os.listdir(folder))`: `os.listdir` retorna archivos en orden del filesystem (no
+  garantizado). `sorted()` garantiza orden alfabético, haciendo los bloques del system
+  prompt deterministas (el orden importa para que el modelo cite correctamente).
+- `fname.lower().endswith(".pdf")`: `.lower()` hace el filtro case-insensitive —
+  maneja `"paper.PDF"`, `"paper.Pdf"`, etc. Sin `.lower()`, solo matchearía `.pdf` minúscula.
+- `os.path.join(folder, fname)`: Construye la ruta correctamente independiente del OS
+  (`data/archivo.pdf` en Unix, `data\archivo.pdf` en Windows).
+- `try/except`: Si un PDF está corrupto o en un formato extraño, lo salta y continúa con
+  los demás. Sin esto, un archivo malo rompería la carga de toda la carpeta.
+- Retorna un `dict` con `{nombre_archivo: texto}` — estructura usada en todo el sistema.
+
+**Variable `base_docs`:** Se ejecuta una sola vez al cargar la celda:
+```python
+base_docs = load_pdfs_from_folder("data")
+```
+Queda en memoria para toda la sesión. Si se agregaran archivos a `data/` mientras Jupyter
+está corriendo, no se reflejarían — habría que re-ejecutar la celda.
+
+---
+
+### Función 2: `build_system_prompt_multi(docs: dict) -> str`
+
+```python
+def build_system_prompt_multi(docs: dict) -> str:
+    """Construye system prompt para múltiples documentos con etiquetas de origen."""
+    bloques = []
+    for i, (nombre, texto) in enumerate(docs.items(), 1):
+        bloques.append(
+            f"=== DOCUMENTO {i}: {nombre} ===\n{texto}\n=== FIN DOCUMENTO {i}: {nombre} ==="
+        )
+    documentos_str = "\n\n".join(bloques)
+    nombres = ", ".join(docs.keys())
+
+    return f"""Eres un asistente experto en análisis de documentos académicos.
+Tienes acceso a {len(docs)} documento(s): {nombres}
+
+{documentos_str}
+
+INSTRUCCIONES IMPORTANTES:
+1. Responde EXCLUSIVAMENTE con información que esté en los documentos proporcionados.
+2. SIEMPRE indica de cuál documento proviene cada afirmación con el formato [nombre_archivo.pdf].
+   Ejemplo: "Según [attention_is_all_you_need.pdf], el modelo usa 6 capas de encoder."
+3. Si la respuesta involucra varios documentos, cita cada uno con su etiqueta.
+4. Si la información no está en ningún documento, responde exactamente:
+   "La información no se encuentra en los documentos cargados."
+5. NO uses conocimiento general; cíñete al contenido de los documentos.
+6. Incluye citas textuales (entre comillas) junto a la etiqueta del documento fuente."""
+```
+
+**Línea por línea:**
+- `enumerate(docs.items(), 1)`: Itera sobre pares `(nombre, texto)` del dict asignando
+  número desde 1. Produce `(1, "archivo.pdf", "texto...")`, `(2, "otro.pdf", "texto...")`.
+- **Bloque con etiquetas dobles** (apertura + cierre):
+  ```
+  === DOCUMENTO 1: attention_is_all_you_need.pdf ===
+  [texto del paper]
+  === FIN DOCUMENTO 1: attention_is_all_you_need.pdf ===
+  ```
+  - Los delimitadores `===` son claramente distintos del texto del documento
+  - El nombre del archivo aparece tanto en apertura como en cierre — el modelo sabe dónde
+    termina un documento y empieza otro, sin confundir el texto de diferentes PDFs
+  - El número (DOCUMENTO 1, DOCUMENTO 2) permite referencias cruzadas
+- `"\n\n".join(bloques)`: Dos saltos de línea entre documentos — más legible para el modelo
+  que `"\n"` simple, especialmente con documentos que terminan sin salto.
+- `nombres = ", ".join(docs.keys())`: Lista de nombres para la primera línea del prompt —
+  el modelo lee ahí de un vistazo cuántos y cuáles documentos tiene disponibles.
+- **Instrucción 2 (clave del feature):** `[nombre_archivo.pdf]` es un formato XML-like
+  reconocible. Se eligió corchetes porque no son caracteres especiales en Markdown (no se
+  renderizan como algo especial en Gradio) pero sí son visualmente distintos del texto.
+- **Instrucción 4:** Respuesta exacta predefinida para cuando no hay info — facilita testing.
+
+**Diferencia vs `build_system_prompt` original:**
+- Original: un solo bloque `--- INICIO DEL DOCUMENTO ---` sin nombre del archivo
+- Multi: múltiples bloques numerados y nombrados, con instrucción explícita de citar fuente
+
+---
+
+### Función 3: `chat_multi_pdf(message, history, uploaded_files, use_defaults)`
+
+```python
+def chat_multi_pdf(message: str, history: list, uploaded_files, use_defaults: bool):
+    """Chat que responde de múltiples PDFs e indica la fuente de cada respuesta."""
+    docs = {}
+
+    # Documentos base precargados de la carpeta data/
+    if use_defaults:
+        docs.update(base_docs)            # Copia {nombre: texto} de base_docs → docs
+
+    # PDFs subidos dinámicamente por el usuario
+    if uploaded_files:
+        files = uploaded_files if isinstance(uploaded_files, list) else [uploaded_files]
+        for f in files:
+            nombre = os.path.basename(f)  # Solo el nombre de archivo, no la ruta completa
+            try:
+                docs[nombre] = extract_text_from_pdf(f)  # f = ruta temporal de Gradio
+            except Exception as e:
+                docs[nombre] = f"[Error al leer el archivo: {e}]"
+
+    if not docs:
+        yield "No hay documentos cargados. Sube al menos un PDF o activa los documentos base."
+        return
+
+    system_prompt = build_system_prompt_multi(docs)
+
+    contenido = []
+    for entry in history:
+        if isinstance(entry, dict):
+            role = "model" if entry["role"] == "assistant" else "user"
+            contenido.append(types.Content(role=role, parts=[types.Part(text=get_text(entry["content"]))]))
+        elif isinstance(entry, (list, tuple)) and len(entry) == 2:
+            u, a = entry
+            contenido.append(types.Content(role="user", parts=[types.Part(text=get_text(u))]))
+            if a:
+                contenido.append(types.Content(role="model", parts=[types.Part(text=get_text(a))]))
+
+    contenido.append(types.Content(role="user", parts=[types.Part(text=message)]))
+
+    respuesta = ""
+    for chunk in client.models.generate_content_stream(
+        model=MODELO,
+        config=types.GenerateContentConfig(system_instruction=system_prompt),
+        contents=contenido
+    ):
+        if chunk.text:
+            respuesta += chunk.text
+            yield respuesta
+```
+
+**Línea por línea (partes nuevas respecto a `chat_con_documento`):**
+
+- `docs = {}`: Diccionario vacío que se construye dinámicamente cada llamada. Es importante
+  que sea local a la función — si fuera global, una subida de un usuario afectaría a otro.
+
+- `if use_defaults: docs.update(base_docs)`: El checkbox "Incluir documentos base" en Gradio
+  pasa `True`/`False` como `use_defaults`. `dict.update()` copia todos los pares del dict
+  fuente al destino — equivale a `docs = {**base_docs}` pero más legible. Si `use_defaults`
+  es `False`, `docs` empieza vacío y solo contiene los archivos subidos.
+
+- `uploaded_files if isinstance(uploaded_files, list) else [uploaded_files]`: Gradio puede
+  pasar un solo path (string) o lista de paths según cuántos archivos se suban. Este one-liner
+  normaliza ambos casos a lista. Sin esto, `for f in "ruta/archivo.pdf"` iteraría
+  carácter por carácter (bug silencioso).
+
+- `os.path.basename(f)`: Gradio guarda uploads en rutas temporales como
+  `C:/Users/.../AppData/Local/Temp/gradio_xyz/archivo.pdf`. `basename` extrae solo
+  `"archivo.pdf"` — el nombre que el modelo verá en el system prompt y en las citas.
+  Sin `basename`, el bloque diría `=== DOCUMENTO 2: C:/Users/.../archivo.pdf ===`, confuso.
+
+- `docs[nombre] = f"[Error al leer el archivo: {e}]"`: Si un PDF está corrupto, en vez de
+  crashear el chat, el modelo recibe el mensaje de error como "contenido" del documento.
+  Cuando el usuario pregunte sobre ese archivo, el modelo responderá que tuvo un error.
+
+- `if not docs: yield "..."; return`: Caso borde — si `use_defaults=False` y no se subió
+  ningún archivo, `docs` queda vacío. `yield` envía el mensaje de error a Gradio (streaming)
+  y `return` termina el generador. Sin el `return`, Python continuaría y `build_system_prompt_multi`
+  recibiría un dict vacío, generando un system prompt malformado.
+
+- El resto del manejo de historial y streaming es idéntico a `chat_con_documento`. La única
+  diferencia funcional es que `system_prompt` ahora viene de `build_system_prompt_multi`.
+
+---
+
+### Interfaz Gradio — `demo_multi`
+
+```python
+demo_multi = gr.ChatInterface(
+    fn=chat_multi_pdf,
+    title="Asistente Multi-Documento — Cita la fuente automáticamente",
+    description=(
+        "Pregunta sobre cualquier documento cargado. "
+        "El asistente indica de cuál PDF proviene cada respuesta usando [nombre.pdf].\n"
+        f"Documentos base: {', '.join(base_docs.keys())}"
+    ),
+    additional_inputs=[
+        gr.File(
+            label="Agregar PDFs adicionales (opcional)",
+            file_types=[".pdf"],
+            file_count="multiple",      # Permite subir varios PDFs a la vez
+        ),
+        gr.Checkbox(label="Incluir documentos base de la carpeta data/", value=True),
+    ],
+    examples=[
+        "¿De qué trata cada documento?",
+        "¿Cuál es la idea principal del paper sobre transformers?",
+        "Compara los enfoques de los diferentes documentos",
+    ],
+    flagging_mode="never",
+)
+
+demo_multi.launch(server_name="0.0.0.0", server_port=8082, show_error=True)
+```
+
+**Puntos clave:**
+- `gr.File(file_count="multiple")`: A diferencia de Mejora B (`file_count` por defecto = `"single"`),
+  aquí el usuario puede seleccionar múltiples PDFs a la vez en el explorador de archivos.
+  Gradio los pasa como lista de rutas temporales en `uploaded_files`.
+- `gr.Checkbox(value=True)`: El checkbox empieza marcado — por defecto se incluyen los documentos
+  base. El usuario puede desmarcarlo si solo quiere trabajar con sus archivos subidos.
+- `description` dinámica con f-string: Muestra en la interfaz los nombres de los documentos
+  base al momento de lanzar. Si se recargara el notebook con más PDFs en `data/`, la
+  descripción se actualizaría automáticamente.
+- `additional_inputs` pasa dos valores a `chat_multi_pdf`: `uploaded_files` y `use_defaults`.
+  El orden debe coincidir exactamente con el orden de parámetros en la función (después de
+  `message` e `history` que Gradio pasa siempre como primeros argumentos).
+
+---
+
+### Resultado verificado con API real
+
+**Test 1 — "¿De qué trata cada documento?"** (2 PDFs cargados):
+```
+[attention_is_all_you_need.pdf] presenta el Transformer, una nueva arquitectura
+que se basa enteramente en mecanismos de atención, eliminando la recurrencia...
+
+[test_academic_es.pdf] trata sobre el aprendizaje residual profundo para el
+reconocimiento de imágenes (ResNet), abordando el problema de degradación de
+precisión con redes muy profundas...
+```
+
+**Test 2 — "¿Cuál es el mecanismo de atención multi-cabeza?"**:
+```
+Permite al modelo atender a información de diferentes subespacios en diferentes
+posiciones [attention_is_all_you_need.pdf]. En lugar de una única función de
+atención, se proyectan Q, K, V h veces con proyecciones lineales aprendidas...
+[attention_is_all_you_need.pdf]
+```
+
+Gemini respetó la instrucción en ambas respuestas: citó `[archivo.pdf]` en cada
+afirmación y cuando la respuesta era de un solo documento, solo apareció esa etiqueta.
+
+---
+
+## BLOQUE 6 de Sustentación: Mejora D — Multi-PDF
+
+**P: ¿Por qué `load_pdfs_from_folder` usa `sorted()`?**
+R: `os.listdir()` no garantiza orden — devuelve archivos en el orden del filesystem, que varía
+entre sistemas operativos y entre ejecuciones. `sorted()` garantiza que el dict `docs` tenga
+siempre el mismo orden alfabético, lo que hace el system prompt determinista. Si el orden
+cambiara, el mismo modelo podría priorizar documentos distintos en respuestas ambiguas.
+
+**P: ¿Por qué los delimitadores tienen el nombre del archivo tanto en apertura como en cierre?**
+R: Con documentos largos (miles de tokens), el modelo puede "olvidar" de cuál documento
+venía el texto al llegar al cierre. Al repetir el nombre en `=== FIN DOCUMENTO 1: archivo.pdf ===`,
+el modelo tiene un ancla de contexto al final de cada bloque. Esto reduce errores de atribución.
+
+**P: ¿Por qué `os.path.basename(f)` y no usar `f` directamente como nombre?**
+R: Gradio guarda archivos subidos en rutas temporales del sistema operativo, por ejemplo
+`C:/Users/Usuario/AppData/Local/Temp/gradio_12345abc/mi_paper.pdf`. Si se usara `f` como
+nombre, el system prompt diría `[C:/Users/.../mi_paper.pdf]` — feo e informativo de más.
+`basename` extrae solo `"mi_paper.pdf"`, que es el nombre legible y suficiente para citar.
+
+**P: ¿Qué pasa si `use_defaults=False` y `uploaded_files` es vacío?**
+R: `docs` queda como dict vacío `{}`. La condición `if not docs` lo detecta, hace `yield`
+del mensaje de error y `return` para terminar el generador. Sin el `return`, la ejecución
+continuaría hacia `build_system_prompt_multi({})`, que generaría un system prompt que dice
+"tienes acceso a 0 documentos: " con cero bloques — el modelo respondería que no tiene información,
+pero de forma confusa. El early return da un mensaje claro al usuario.
+
+**P: ¿Por qué `docs.update(base_docs)` en vez de `docs = base_docs`?**
+R: `docs = base_docs` haría que `docs` sea una referencia al mismo dict que `base_docs`. Si
+luego se hace `docs[nombre] = texto` (al agregar archivos subidos), se estaría modificando
+`base_docs` también — los uploads "contaminarían" los docs base de futuras llamadas.
+`dict.update()` copia los pares sin crear una referencia compartida.
+
+**P: ¿Cuál es el límite práctico de documentos que se pueden cargar simultáneamente?**
+R: Depende del modelo. Gemini 2.5 Flash tiene 1,000,000 tokens de contexto. Con el paper
+"Attention is All You Need" (~10,989 tokens), podrían cargarse ~91 copies del mismo paper.
+En la práctica, con documentos académicos de ~15 páginas (~13K tokens cada uno), el límite
+sería ~76 documentos simultáneos. Con 10 documentos representativos el sistema es estable
+y productivo sin acercarse al límite.
+
+**P: ¿Por qué la `description` de `demo_multi` usa un f-string con `base_docs.keys()`?**
+R: Al momento de crear el objeto `gr.ChatInterface`, `base_docs` ya tiene los documentos
+cargados. El f-string se evalúa en ese instante, insertando la lista real de archivos. Si
+se agregan más PDFs a `data/` y se recarga la celda, la descripción se actualiza sola sin
+tocar el código de la interfaz. Es documentación auto-actualizable.
