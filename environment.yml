@@ -1,0 +1,16 @@
+name: workshop3-ia
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - jupyter
+  - notebook
+  - ipykernel
+  - pip
+  - pip:
+    - pypdf>=4.0.0
+    - gradio>=5.0.0
+    - google-genai>=1.0.0
+    - python-dotenv>=1.0.0
+    - sentence-transformers>=2.0.0
