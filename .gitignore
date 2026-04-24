@@ -3,3 +3,9 @@ data/
 __pycache__/
 *.pyc
 .venv/
+.conda/
+*.ipynb_checkpoints/
+.ipynb_checkpoints/
+.claude/
+generate_test_pdfs.py
+test_suite.py
